@@ -666,7 +666,16 @@ enum class FormulaType {
   AdaNormPQ,
   AdamLogSchedule,
   AdaSignMix,
-  AdamPower
+  AdamPower,
+  // New families
+  RAdam,
+  Nadam,
+  Adamax,
+  Adagrad,
+  Yogi,
+  QHAdam,
+  LAMB,
+  AdaFactorGlobal
 };
 
 struct Candidate {
@@ -684,11 +693,12 @@ struct Candidate {
   double scale2;
   bool bias_correction;
   bool use_belief_second;
+  bool use_trust_ratio; // for LAMB-like scaling
   string pretty;
 
   static Candidate random(RNG &rng) {
     Candidate c{};
-    int t = rng.randint(0, 8);
+    int t = rng.randint(0, 16);
     c.type = static_cast<FormulaType>(t);
     // log-uniform for lr
     double lr_log = rng.uniform(std::log(1e-4), std::log(3e-2));
@@ -704,6 +714,7 @@ struct Candidate {
     c.scale2 = rng.uniform(0.5, 2.0);
     c.bias_correction = (rng.uniform(0.0, 1.0) < 0.7);
     c.use_belief_second = (rng.uniform(0.0, 1.0) < 0.5);
+    c.use_trust_ratio = (c.type == FormulaType::LAMB) ? true : (rng.uniform(0.0, 1.0) < 0.2);
     c.pretty = "";
     return c;
   }
@@ -726,8 +737,9 @@ struct Candidate {
     c.scale2 = safemath::clip(c.scale2 + rng.normal(0.0, 0.2), 0.25, 3.0);
     if (rng.uniform(0.0, 1.0) < 0.2) c.bias_correction = !c.bias_correction;
     if (rng.uniform(0.0, 1.0) < 0.2) c.use_belief_second = !c.use_belief_second;
+    if (rng.uniform(0.0, 1.0) < 0.1) c.use_trust_ratio = !c.use_trust_ratio;
     // 10% chance to flip type
-    if (rng.uniform(0.0, 1.0) < 0.1) c.type = static_cast<FormulaType>(rng.randint(0, 8));
+    if (rng.uniform(0.0, 1.0) < 0.1) c.type = static_cast<FormulaType>(rng.randint(0, 16));
     c.pretty = "";
     return c;
   }
@@ -762,6 +774,30 @@ struct Candidate {
       case FormulaType::AdamPower:
         ss << "update = -lr * m / pow(v+eps, q)";
         break;
+      case FormulaType::RAdam:
+        ss << "update = -lr * r_t * m_hat / (sqrt(v_hat) + eps) [rectified Adam]";
+        break;
+      case FormulaType::Nadam:
+        ss << "update = -lr * (beta1*m_hat + (1-beta1)*g_corr) / (sqrt(v_hat)+eps)";
+        break;
+      case FormulaType::Adamax:
+        ss << "update = -lr * m_hat / (v_inf + eps)";
+        break;
+      case FormulaType::Adagrad:
+        ss << "update = -lr * m / (sqrt(sum(g^2))+eps)";
+        break;
+      case FormulaType::Yogi:
+        ss << "update = -lr * m_hat / (sqrt(v_yogi)+eps)";
+        break;
+      case FormulaType::QHAdam:
+        ss << "update = -lr * m_qh / (sqrt(v_qh)+eps), m_qh=(1-nu1)g+nu1*m, v_qh=(1-nu2)g2+nu2*v";
+        break;
+      case FormulaType::LAMB:
+        ss << "update = -lr * trust_ratio * m_hat / (sqrt(v_hat)+eps), trust in [s1,s2]";
+        break;
+      case FormulaType::AdaFactorGlobal:
+        ss << "update = -lr * m / (rms(v)+eps) [global RMS]";
+        break;
     }
     ss << "; with lr0=" << lr0
        << ", beta1=" << beta1
@@ -774,7 +810,8 @@ struct Candidate {
        << ", s1=" << scale1
        << ", s2=" << scale2
        << ", bias_correction=" << (bias_correction?"true":"false")
-       << ", belief_second=" << (use_belief_second?"true":"false");
+       << ", belief_second=" << (use_belief_second?"true":"false")
+       << ", trust_ratio=" << (use_trust_ratio?"true":"false");
     return ss.str();
   }
 };
@@ -783,11 +820,13 @@ struct OptimState {
   vector<double> m;
   vector<double> v;
   vector<double> v_belief; // for belief style second moment
+  vector<double> v_inf; // for Adamax (infinity norm)
   double t;
   void reset(size_t dim) {
     m.assign(dim, 0.0);
     v.assign(dim, 0.0);
     v_belief.assign(dim, 0.0);
+    v_inf.assign(dim, 0.0);
     t = 0.0;
   }
 };
@@ -831,14 +870,51 @@ struct CandidateRunner {
     vector<double> g = g_in;
     for (size_t i = 0; i < n; ++i) g[i] = safemath::clip(g[i], -grad_clip, grad_clip);
 
-    for (size_t i = 0; i < n; ++i) {
-      st.m[i] = cand.beta1 * st.m[i] + (1.0 - cand.beta1) * g[i];
+    // First moment (momentum-like)
+    for (size_t i = 0; i < n; ++i) st.m[i] = cand.beta1 * st.m[i] + (1.0 - cand.beta1) * g[i];
+
+    // Second moment update depends on type
+    switch (cand.type) {
+      case FormulaType::Adam:
+      case FormulaType::AdamTanh:
+      case FormulaType::AdaBeliefLike:
+      case FormulaType::RMSMom:
+      case FormulaType::LionMix:
+      case FormulaType::AdaNormPQ:
+      case FormulaType::AdamLogSchedule:
+      case FormulaType::AdaSignMix:
+      case FormulaType::AdamPower:
+      case FormulaType::RAdam:
+      case FormulaType::Nadam:
+      case FormulaType::LAMB:
+      case FormulaType::AdaFactorGlobal:
+      case FormulaType::QHAdam: {
+        for (size_t i = 0; i < n; ++i) {
+          double gg = g[i] * g[i];
+          st.v[i] = cand.beta2 * st.v[i] + (1.0 - cand.beta2) * gg;
+        }
+        break;
+      }
+      case FormulaType::Adamax: {
+        for (size_t i = 0; i < n; ++i) {
+          st.v_inf[i] = std::max(cand.beta2 * st.v_inf[i], std::abs(g[i]));
+        }
+        break;
+      }
+      case FormulaType::Adagrad: {
+        for (size_t i = 0; i < n; ++i) st.v[i] += g[i] * g[i];
+        break;
+      }
+      case FormulaType::Yogi: {
+        for (size_t i = 0; i < n; ++i) {
+          double gg = g[i] * g[i];
+          double signv = (st.v[i] - gg) >= 0.0 ? 1.0 : -1.0;
+          st.v[i] = st.v[i] - (1.0 - cand.beta2) * signv * gg;
+        }
+        break;
+      }
     }
-    // Standard second moment
-    for (size_t i = 0; i < n; ++i) {
-      double gg = g[i] * g[i];
-      st.v[i] = cand.beta2 * st.v[i] + (1.0 - cand.beta2) * gg;
-    }
+
     // Belief second moment (variance of prediction error)
     for (size_t i = 0; i < n; ++i) {
       double diff = g[i] - st.m[i];
@@ -851,33 +927,65 @@ struct CandidateRunner {
     double decay = 1.0 / std::sqrt(1.0 + 0.01 * st.t);
     lr_t = lr_t * warm * decay;
 
+    // Build vector of parameter updates
+    vector<double> upd_vec(n, 0.0);
+
+    // Precompute bias correction terms
+    double bc1 = cand.bias_correction ? (1.0 - std::pow(cand.beta1, st.t)) : 1.0;
+    double bc2 = cand.bias_correction ? (1.0 - std::pow(cand.beta2, st.t)) : 1.0;
+
+    // Global measures if needed
+    double global_rms_den = 0.0;
+    if (cand.type == FormulaType::AdaFactorGlobal) {
+      double meanv = 0.0;
+      for (size_t i = 0; i < n; ++i) meanv += st.v[i];
+      meanv /= double(n);
+      global_rms_den = safemath::safe_sqrt(meanv, cand.eps) + cand.eps;
+    }
+
+    // RAdam terms
+    double radam_rt = 1.0;
+    if (cand.type == FormulaType::RAdam) {
+      const double beta2 = cand.beta2;
+      double rho_inf = 2.0 / (1.0 - beta2) - 1.0;
+      double beta2t = std::pow(beta2, st.t);
+      double rho_t = rho_inf - 2.0 * st.t * beta2t / (1.0 - beta2t);
+      if (rho_t > 4.0) {
+        double num = (rho_t - 4.0) * (rho_t - 2.0) * rho_inf;
+        double den = (rho_inf - 4.0) * (rho_inf - 2.0) * rho_t;
+        radam_rt = std::sqrt(std::max(0.0, num / std::max(den, 1e-12)));
+      } else {
+        radam_rt = 0.0; // fall back to SGD with momentum component below
+      }
+    }
+
+    // QHAdam params
+    double nu1 = safemath::clip(cand.scale1, 0.0, 1.0);
+    double nu2 = safemath::clip(cand.scale2, 0.0, 1.0);
+
     for (size_t i = 0; i < n; ++i) {
       double m = st.m[i];
       double v = st.v[i];
       double vb = st.v_belief[i];
-      double mhat = cand.bias_correction ? m / (1.0 - std::pow(cand.beta1, st.t)) : m;
-      double vhat = cand.bias_correction ? v / (1.0 - std::pow(cand.beta2, st.t)) : v;
-      double v_eff = cand.use_belief_second ? vb : vhat;
+      double mhat = m / bc1;
+      double vhat = v / bc2;
       double denom = safemath::safe_sqrt(vhat, cand.eps) + cand.eps;
-      double denom_belief = safemath::safe_sqrt(v_eff, cand.eps) + cand.eps;
+      double denom_belief = safemath::safe_sqrt(cand.use_belief_second ? vb : vhat, cand.eps) + cand.eps;
       double upd = 0.0;
+
       switch (cand.type) {
-        case FormulaType::Adam: {
+        case FormulaType::Adam:
           upd = -lr_t * (mhat / denom);
           break;
-        }
-        case FormulaType::AdamTanh: {
+        case FormulaType::AdamTanh:
           upd = -lr_t * (std::tanh(mhat) / denom);
           break;
-        }
-        case FormulaType::AdaBeliefLike: {
+        case FormulaType::AdaBeliefLike:
           upd = -lr_t * (mhat / denom_belief);
           break;
-        }
-        case FormulaType::RMSMom: {
+        case FormulaType::RMSMom:
           upd = -lr_t * (m / denom);
           break;
-        }
         case FormulaType::LionMix: {
           double s = (1.0 - cand.beta1) * safemath::sign(g[i]) + cand.beta1 * safemath::sign(m);
           upd = -lr_t * s;
@@ -904,13 +1012,68 @@ struct CandidateRunner {
           upd = -lr_t * (m / den);
           break;
         }
+        case FormulaType::RAdam: {
+          if (radam_rt > 0.0) upd = -lr_t * radam_rt * (mhat / denom);
+          else upd = -lr_t * (mhat); // unrectified fallback
+          break;
+        }
+        case FormulaType::Nadam: {
+          double g_corr = g[i] / bc1;
+          double m_nest = cand.beta1 * mhat + (1.0 - cand.beta1) * g_corr;
+          upd = -lr_t * (m_nest / denom);
+          break;
+        }
+        case FormulaType::Adamax: {
+          double vinf = st.v_inf[i];
+          upd = -lr_t * (mhat / (vinf + cand.eps));
+          break;
+        }
+        case FormulaType::Adagrad: {
+          double d = safemath::safe_sqrt(st.v[i], cand.eps) + cand.eps;
+          upd = -lr_t * (m / d);
+          break;
+        }
+        case FormulaType::Yogi: {
+          double d = safemath::safe_sqrt(st.v[i], cand.eps) + cand.eps;
+          upd = -lr_t * (mhat / d);
+          break;
+        }
+        case FormulaType::QHAdam: {
+          double mq = (1.0 - nu1) * g[i] + nu1 * m;
+          double vq = (1.0 - nu2) * (g[i] * g[i]) + nu2 * v;
+          double d = safemath::safe_sqrt(vq / bc2, cand.eps) + cand.eps;
+          upd = -lr_t * (mq / (cand.bias_correction ? d : (safemath::safe_sqrt(vq, cand.eps) + cand.eps)));
+          break;
+        }
+        case FormulaType::LAMB: {
+          upd = -lr_t * (mhat / denom); // trust ratio applied after loop
+          break;
+        }
+        case FormulaType::AdaFactorGlobal: {
+          upd = -lr_t * (m / global_rms_den);
+          break;
+        }
       }
-      // Coordinate-wise update clip for stability
-      upd = safemath::clip(upd, -update_clip, update_clip);
-      w[i] += upd;
-      if (cand.weight_decay > 0.0) {
-        w[i] *= (1.0 - lr_t * cand.weight_decay);
-      }
+      upd_vec[i] = safemath::clip(upd, -update_clip, update_clip);
+    }
+
+    // LAMB trust ratio scaling (layer-wise adaptive moments)
+    if (cand.type == FormulaType::LAMB || cand.use_trust_ratio) {
+      double w_norm_sq = 0.0, u_norm_sq = 0.0;
+      for (size_t i = 0; i < n; ++i) { w_norm_sq += w[i] * w[i]; u_norm_sq += upd_vec[i] * upd_vec[i]; }
+      double w_norm = std::sqrt(std::max(0.0, w_norm_sq));
+      double u_norm = std::sqrt(std::max(0.0, u_norm_sq));
+      double ratio = (u_norm > 0.0) ? (w_norm / (u_norm + cand.eps)) : 1.0;
+      double lo = std::min(cand.scale1, cand.scale2);
+      double hi = std::max(cand.scale1, cand.scale2);
+      ratio = safemath::clip(ratio, lo, hi);
+      for (size_t i = 0; i < n; ++i) upd_vec[i] *= ratio;
+    }
+
+    // Apply updates and decoupled weight decay
+    for (size_t i = 0; i < n; ++i) {
+      w[i] += upd_vec[i];
+      if (cand.weight_decay > 0.0) w[i] *= (1.0 - lr_t * cand.weight_decay);
     }
   }
 };
